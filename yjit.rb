@@ -64,7 +64,6 @@ module RubyVM::YJIT
     end
 
     at_exit { print_and_dump_stats } if stats
-    call_yjit_hooks
     Primitive.rb_yjit_enable(stats, stats != :quiet, log, log != :quiet, mem_size, call_threshold)
   end
 
@@ -265,23 +264,23 @@ module RubyVM::YJIT
   end
 
   # Blocks that are called when YJIT is enabled
-  @yjit_hooks = []
+  @jit_hooks = []
 
   class << self
     # :stopdoc:
     private
 
     # Register a block to be called when YJIT is enabled
-    def add_yjit_hook(hook)
-      @yjit_hooks << hook
+    def add_jit_hook(hook)
+      @jit_hooks << hook
     end
 
-    # Run YJIT hooks registered by RubyVM::YJIT.with_yjit
-    def call_yjit_hooks
+    # Run YJIT hooks registered by `#with_jit`
+    def call_jit_hooks
       # Skip using builtin methods in Ruby if --yjit-c-builtin is given
       return if Primitive.yjit_c_builtin_p
-      @yjit_hooks.each(&:call)
-      @yjit_hooks.clear
+      @jit_hooks.each(&:call)
+      @jit_hooks.clear
     end
 
     # Print stats and dump exit locations

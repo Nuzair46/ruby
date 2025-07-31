@@ -1,8 +1,9 @@
-use crate::cruby::{self, rb_bug_panic_hook, EcPtr, Qnil, VALUE};
+use crate::cruby::{self, rb_bug_panic_hook, rb_vm_insns_count, EcPtr, Qnil, VALUE};
 use crate::cruby_methods;
 use crate::invariants::Invariants;
-use crate::options::Options;
 use crate::asm::CodeBlock;
+use crate::options::get_option;
+use crate::stats::Counters;
 
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
@@ -18,8 +19,8 @@ pub struct ZJITState {
     /// Inline code block (fast path)
     code_block: CodeBlock,
 
-    /// ZJIT command-line options
-    options: Options,
+    /// ZJIT statistics
+    counters: Counters,
 
     /// Assumptions that require invalidation
     invariants: Invariants,
@@ -35,11 +36,12 @@ pub struct ZJITState {
 static mut ZJIT_STATE: Option<ZJITState> = None;
 
 impl ZJITState {
-    /// Initialize the ZJIT globals, given options allocated by rb_zjit_init_options()
-    pub fn init(options: Options) {
+    /// Initialize the ZJIT globals
+    pub fn init() {
         #[cfg(not(test))]
         let cb = {
             use crate::cruby::*;
+            use crate::options::*;
 
             let exec_mem_size: usize = 64 * 1024 * 1024; // TODO: implement the option
             let virt_block: *mut u8 = unsafe { rb_zjit_reserve_addr_space(64 * 1024 * 1024) };
@@ -71,7 +73,7 @@ impl ZJITState {
             );
             let mem_block = Rc::new(RefCell::new(mem_block));
 
-            CodeBlock::new(mem_block.clone(), options.dump_disasm)
+            CodeBlock::new(mem_block.clone(), get_option!(dump_disasm))
         };
         #[cfg(test)]
         let cb = CodeBlock::new_dummy();
@@ -79,7 +81,7 @@ impl ZJITState {
         // Initialize the codegen globals instance
         let zjit_state = ZJITState {
             code_block: cb,
-            options,
+            counters: Counters::default(),
             invariants: Invariants::default(),
             assert_compiles: false,
             method_annotations: cruby_methods::init(),
@@ -102,11 +104,6 @@ impl ZJITState {
         &mut ZJITState::get_instance().code_block
     }
 
-    /// Get a mutable reference to the options
-    pub fn get_options() -> &'static mut Options {
-        &mut ZJITState::get_instance().options
-    }
-
     /// Get a mutable reference to the invariants
     pub fn get_invariants() -> &'static mut Invariants {
         &mut ZJITState::get_instance().invariants
@@ -126,21 +123,60 @@ impl ZJITState {
         let instance = ZJITState::get_instance();
         instance.assert_compiles = true;
     }
+
+    /// Get a mutable reference to counters for ZJIT stats
+    pub fn get_counters() -> &'static mut Counters {
+        &mut ZJITState::get_instance().counters
+    }
+
+    /// Was --zjit-save-compiled-iseqs specified?
+    pub fn should_log_compiled_iseqs() -> bool {
+        get_option!(log_compiled_iseqs).is_some()
+    }
+
+    /// Log the name of a compiled ISEQ to the file specified in options.log_compiled_iseqs
+    pub fn log_compile(iseq_name: String) {
+        assert!(ZJITState::should_log_compiled_iseqs());
+        let filename = get_option!(log_compiled_iseqs).as_ref().unwrap();
+        use std::io::Write;
+        let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(filename) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("ZJIT: Failed to create file '{}': {}", filename, e);
+                return;
+            }
+        };
+        if let Err(e) = writeln!(file, "{}", iseq_name) {
+            eprintln!("ZJIT: Failed to write to file '{}': {}", filename, e);
+        }
+    }
+
+    /// Check if we are allowed to compile a given ISEQ based on --zjit-allowed-iseqs
+    pub fn can_compile_iseq(iseq: cruby::IseqPtr) -> bool {
+        if let Some(ref allowed_iseqs) = get_option!(allowed_iseqs) {
+            let name = cruby::iseq_get_location(iseq, 0);
+            allowed_iseqs.contains(&name)
+        } else {
+            true // If no restrictions, allow all ISEQs
+        }
+    }
 }
 
-/// Initialize ZJIT, given options allocated by rb_zjit_init_options()
+/// Initialize ZJIT
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_zjit_init(options: *const u8) {
+pub extern "C" fn rb_zjit_init() {
     // Catch panics to avoid UB for unwinding into C frames.
     // See https://doc.rust-lang.org/nomicon/exception-safety.html
     let result = std::panic::catch_unwind(|| {
+        // Initialize ZJIT states
         cruby::ids::init();
+        ZJITState::init();
 
-        let options = unsafe { Box::from_raw(options as *mut Options) };
-        ZJITState::init(*options);
-        std::mem::drop(options);
-
+        // Install a panic hook for ZJIT
         rb_bug_panic_hook();
+
+        // Discard the instruction count for boot which we never compile
+        unsafe { rb_vm_insns_count = 0; }
 
         // ZJIT enabled and initialized successfully
         assert!(unsafe{ !rb_zjit_enabled_p });
