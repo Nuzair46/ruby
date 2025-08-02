@@ -522,7 +522,12 @@ pub enum Insn {
     },
 
     // Invoke a builtin function
-    InvokeBuiltin { bf: rb_builtin_function, args: Vec<InsnId>, state: InsnId },
+    InvokeBuiltin {
+        bf: rb_builtin_function,
+        args: Vec<InsnId>,
+        state: InsnId,
+        return_type: Option<Type>,  // None for unannotated builtins
+    },
 
     /// Control flow instructions
     Return { val: InsnId },
@@ -796,6 +801,8 @@ impl std::fmt::Display for Insn {
 /// An extended basic block in a [`Function`].
 #[derive(Default, Debug)]
 pub struct Block {
+    /// The index of the first YARV instruction for the Block in the ISEQ
+    pub insn_idx: u32,
     params: Vec<InsnId>,
     insns: Vec<InsnId>,
 }
@@ -1024,9 +1031,11 @@ impl Function {
         }
     }
 
-    fn new_block(&mut self) -> BlockId {
+    fn new_block(&mut self, insn_idx: u32) -> BlockId {
         let id = BlockId(self.blocks.len());
-        self.blocks.push(Block::default());
+        let mut block = Block::default();
+        block.insn_idx = insn_idx;
+        self.blocks.push(block);
         id
     }
 
@@ -1159,7 +1168,7 @@ impl Function {
                 args: find_vec!(args),
                 state,
             },
-            &InvokeBuiltin { bf, ref args, state } => InvokeBuiltin { bf: bf, args: find_vec!(args), state },
+            &InvokeBuiltin { bf, ref args, state, return_type } => InvokeBuiltin { bf, args: find_vec!(args), state, return_type },
             &ArrayDup { val, state } => ArrayDup { val: find!(val), state },
             &HashDup { val, state } => HashDup { val: find!(val), state },
             &CCall { cfun, ref args, name, return_type, elidable } => CCall { cfun, args: find_vec!(args), name, return_type, elidable },
@@ -1256,7 +1265,7 @@ impl Function {
             Insn::SendWithoutBlock { .. } => types::BasicObject,
             Insn::SendWithoutBlockDirect { .. } => types::BasicObject,
             Insn::Send { .. } => types::BasicObject,
-            Insn::InvokeBuiltin { .. } => types::BasicObject,
+            Insn::InvokeBuiltin { return_type, .. } => return_type.unwrap_or(types::BasicObject),
             Insn::Defined { .. } => types::BasicObject,
             Insn::DefinedIvar { .. } => types::BasicObject,
             Insn::GetConstantPath { .. } => types::BasicObject,
@@ -2543,7 +2552,7 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
         if insn_idx == 0 {
             todo!("Separate entry block for param/self/...");
         }
-        insn_idx_to_block.insert(insn_idx, fun.new_block());
+        insn_idx_to_block.insert(insn_idx, fun.new_block(insn_idx));
     }
 
     // Iteratively fill out basic blocks using a queue
@@ -3115,7 +3124,18 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     args.reverse();
 
                     let exit_id = fun.push_insn(block, Insn::Snapshot { state: exit_state });
-                    let insn_id = fun.push_insn(block, Insn::InvokeBuiltin { bf, args, state: exit_id });
+
+                    // Check if this builtin is annotated
+                    let return_type = ZJITState::get_method_annotations()
+                        .get_builtin_properties(&bf)
+                        .map(|props| props.return_type);
+
+                    let insn_id = fun.push_insn(block, Insn::InvokeBuiltin {
+                        bf,
+                        args,
+                        state: exit_id,
+                        return_type,
+                    });
                     state.stack_push(insn_id);
                 }
                 YARVINSN_opt_invokebuiltin_delegate |
@@ -3130,7 +3150,18 @@ pub fn iseq_to_hir(iseq: *const rb_iseq_t) -> Result<Function, ParseError> {
                     }
 
                     let exit_id = fun.push_insn(block, Insn::Snapshot { state: exit_state });
-                    let insn_id = fun.push_insn(block, Insn::InvokeBuiltin { bf, args, state: exit_id });
+
+                    // Check if this builtin is annotated
+                    let return_type = ZJITState::get_method_annotations()
+                        .get_builtin_properties(&bf)
+                        .map(|props| props.return_type);
+
+                    let insn_id = fun.push_insn(block, Insn::InvokeBuiltin {
+                        bf,
+                        args,
+                        state: exit_id,
+                        return_type,
+                    });
                     state.stack_push(insn_id);
                 }
                 YARVINSN_objtostring => {
@@ -3243,7 +3274,7 @@ mod rpo_tests {
     fn jump() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let exit = function.new_block();
+        let exit = function.new_block(0);
         function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::Return { val });
@@ -3254,8 +3285,8 @@ mod rpo_tests {
     fn diamond_iftrue() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
-        let exit = function.new_block();
+        let side = function.new_block(0);
+        let exit = function.new_block(0);
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfTrue { val, target: BranchEdge { target: side, args: vec![] } });
@@ -3269,8 +3300,8 @@ mod rpo_tests {
     fn diamond_iffalse() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
-        let exit = function.new_block();
+        let side = function.new_block(0);
+        let exit = function.new_block(0);
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfFalse { val, target: BranchEdge { target: side, args: vec![] } });
@@ -3325,7 +3356,7 @@ mod validation_tests {
     fn iftrue_mismatch_args() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
+        let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfTrue { val, target: BranchEdge { target: side, args: vec![val, val, val] } });
         assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(entry, 0, 3));
@@ -3335,7 +3366,7 @@ mod validation_tests {
     fn iffalse_mismatch_args() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
+        let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::IfFalse { val, target: BranchEdge { target: side, args: vec![val, val, val] } });
         assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(entry, 0, 3));
@@ -3345,7 +3376,7 @@ mod validation_tests {
     fn jump_mismatch_args() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
+        let side = function.new_block(0);
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
         function.push_insn(entry, Insn::Jump ( BranchEdge { target: side, args: vec![val, val, val] } ));
         assert_matches_err(function.validate(), ValidationError::MismatchedBlockArity(entry, 0, 3));
@@ -3377,8 +3408,8 @@ mod validation_tests {
         // This tests that one branch is missing a definition which fails.
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
-        let exit = function.new_block();
+        let side = function.new_block(0);
+        let exit = function.new_block(0);
         let v0 = function.push_insn(side, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         let val1 = function.push_insn(entry, Insn::Const { val: Const::CBool(false) });
@@ -3396,8 +3427,8 @@ mod validation_tests {
         // This tests that both branches with a definition succeeds.
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
-        let exit = function.new_block();
+        let side = function.new_block(0);
+        let exit = function.new_block(0);
         let v0 = function.push_insn(entry, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         let val = function.push_insn(entry, Insn::Const { val: Const::CBool(false) });
@@ -3437,7 +3468,7 @@ mod validation_tests {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
         let val = function.push_insn(entry, Insn::Const { val: Const::Value(Qnil) });
-        let exit = function.new_block();
+        let exit = function.new_block(0);
         function.push_insn(entry, Insn::Jump(BranchEdge { target: exit, args: vec![] }));
         function.push_insn_id(exit, val);
         function.push_insn(exit, Insn::Return { val });
@@ -3532,8 +3563,8 @@ mod infer_tests {
     fn diamond_iffalse_merge_fixnum() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
-        let exit = function.new_block();
+        let side = function.new_block(0);
+        let exit = function.new_block(0);
         let v0 = function.push_insn(side, Insn::Const { val: Const::Value(VALUE::fixnum_from_usize(3)) });
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![v0] }));
         let val = function.push_insn(entry, Insn::Const { val: Const::CBool(false) });
@@ -3551,8 +3582,8 @@ mod infer_tests {
     fn diamond_iffalse_merge_bool() {
         let mut function = Function::new(std::ptr::null());
         let entry = function.entry_block;
-        let side = function.new_block();
-        let exit = function.new_block();
+        let side = function.new_block(0);
+        let exit = function.new_block(0);
         let v0 = function.push_insn(side, Insn::Const { val: Const::Value(Qtrue) });
         function.push_insn(side, Insn::Jump(BranchEdge { target: exit, args: vec![v0] }));
         let val = function.push_insn(entry, Insn::Const { val: Const::CBool(false) });
@@ -4969,23 +5000,53 @@ mod tests {
     }
 
     #[test]
-    fn test_invokebuiltin_delegate_with_args() {
+    fn test_invokebuiltin_delegate_annotated() {
         assert_method_hir_with_opcode("Float", YARVINSN_opt_invokebuiltin_delegate_leave, expect![[r#"
             fn Float@<internal:kernel>:197:
             bb0(v0:BasicObject, v1:BasicObject, v2:BasicObject, v3:BasicObject):
-              v6:BasicObject = InvokeBuiltin rb_f_float, v0, v1, v2
+              v6:Flonum = InvokeBuiltin rb_f_float, v0, v1, v2
               Jump bb1(v0, v1, v2, v3, v6)
-            bb1(v8:BasicObject, v9:BasicObject, v10:BasicObject, v11:BasicObject, v12:BasicObject):
+            bb1(v8:BasicObject, v9:BasicObject, v10:BasicObject, v11:BasicObject, v12:Flonum):
               Return v12
         "#]]);
     }
 
     #[test]
-    fn test_invokebuiltin_delegate_without_args() {
+    fn test_invokebuiltin_cexpr_annotated() {
         assert_method_hir_with_opcode("class", YARVINSN_opt_invokebuiltin_delegate_leave, expect![[r#"
             fn class@<internal:kernel>:20:
             bb0(v0:BasicObject):
-              v3:BasicObject = InvokeBuiltin _bi20, v0
+              v3:Class = InvokeBuiltin _bi20, v0
+              Jump bb1(v0, v3)
+            bb1(v5:BasicObject, v6:Class):
+              Return v6
+        "#]]);
+    }
+
+    #[test]
+    fn test_invokebuiltin_delegate_with_args() {
+        // Using an unannotated builtin to test InvokeBuiltin generation
+        let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("Dir", "open"));
+        assert!(iseq_contains_opcode(iseq, YARVINSN_opt_invokebuiltin_delegate), "iseq Dir.open does not contain invokebuiltin");
+        let function = iseq_to_hir(iseq).unwrap();
+        assert_function_hir(function, expect![[r#"
+            fn open@<internal:dir>:184:
+            bb0(v0:BasicObject, v1:BasicObject, v2:BasicObject, v3:BasicObject, v4:BasicObject):
+              v5:NilClass = Const Value(nil)
+              v8:BasicObject = InvokeBuiltin dir_s_open, v0, v1, v2
+              SideExit UnknownOpcode(getblockparamproxy)
+        "#]]);
+    }
+
+    #[test]
+    fn test_invokebuiltin_delegate_without_args() {
+        let iseq = crate::cruby::with_rubyvm(|| get_method_iseq("GC", "enable"));
+        assert!(iseq_contains_opcode(iseq, YARVINSN_opt_invokebuiltin_delegate_leave), "iseq GC.enable does not contain invokebuiltin");
+        let function = iseq_to_hir(iseq).unwrap();
+        assert_function_hir(function, expect![[r#"
+            fn enable@<internal:gc>:55:
+            bb0(v0:BasicObject):
+              v3:BasicObject = InvokeBuiltin gc_enable, v0
               Jump bb1(v0, v3)
             bb1(v5:BasicObject, v6:BasicObject):
               Return v6
